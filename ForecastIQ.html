@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>ForecastIQ — Free Forecast Defense Generator</title>
+<meta name="description" content="Paste your CRM export and call notes. Get a boardroom-ready forecast defense report in seconds. Free, no signup, nothing stored." />
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #ffffff;
+    color: #1e293b;
+  }
+  #root {
+    max-width: 880px;
+    margin: 0 auto;
+    padding: 32px 24px 80px;
+  }
+  button {
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 9px 16px;
+    border-radius: 8px;
+    border: 1px solid #e2e8f0;
+    background: #ffffff;
+    color: #334155;
+    cursor: pointer;
+  }
+  button:hover { background: #f8fafc; }
+  button:disabled { color: #cbd5e1; cursor: not-allowed; background: #ffffff; }
+  button.primary {
+    background: #1e293b;
+    color: #ffffff;
+    border-color: #1e293b;
+  }
+  button.primary:hover { background: #334155; }
+  button.primary:disabled { background: #e2e8f0; border-color: #e2e8f0; color: #94a3b8; }
+  textarea {
+    font-family: inherit;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #f8fafc;
+    padding: 10px;
+    width: 100%;
+    resize: none;
+  }
+  textarea:focus { outline: 2px solid #cbd5e1; }
+  a { color: #0d9488; }
+  @media print {
+    button, .no-print { display: none; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, Fragment } = React;
+
+// ───────────────────────────────────────────────────────────────────────────
+// SAMPLE DATA — for the "try it with sample data" path
+// ───────────────────────────────────────────────────────────────────────────
+
+const SAMPLE_CSV = `Deal Name,Account,ARR,Stage,Close Date,Owner,Last Activity,Days In Stage
+Arcturus Manufacturing,Arcturus Mfg,820000,Negotiation,2024-12-19,Maria Lopez,2024-12-02,12
+Meridian Health Systems,Meridian Health,480000,Proposal,2024-12-27,James Park,2024-11-30,9
+Thornfield Logistics,Thornfield Logistics,310000,Negotiation,2024-12-20,Darius Mills,2024-12-03,18
+Castlegate Financial,Castlegate Financial,275000,Proposal,2024-12-22,Priya Nair,2024-12-01,14
+NovaBridge Tech,NovaBridge Tech,195000,Negotiation,2024-12-18,Maria Lopez,2024-11-28,21
+BluePeak Retail,BluePeak Retail,240000,Negotiation,2025-01-10,James Park,2024-12-04,26
+Vertex Solutions,Vertex Solutions,290000,Proposal,2025-01-15,Darius Mills,2024-11-29,31`;
+
+const SAMPLE_NOTES = `Arcturus Manufacturing - Maria: Multi-threaded with CFO, COO, IT Director, and procurement lead. MSA redlines returned Dec 2, in final legal review now. Champion has internal deadline tied to Jan go-live. Mutual action plan signed. Legal says 5-7 business days to close remaining redline (one indemnification clause, we have fallback language ready).
+
+Meridian Health Systems - James: Champion James Okafor very engaged, has political capital riding on this. Board presentation using our platform scheduled Jan 8, hard deadline for them. POC results were 94% accuracy vs 71% incumbent. Verbal commit given Nov 30. BUT legal review has not formally started - procurement kickoff call scheduled Dec 9. Need to escalate.
+
+Thornfield Logistics - Darius: Budget approved, PO process started, confirmed with CFO directly Dec 3. PO expected Dec 13. Risk: single-threaded through procurement contact Marcus Webb, no backup contact identified, worried about holiday coverage.
+
+Castlegate Financial - Priya: Strong upside deal. CFO is primary buyer but traveling Dec 15 through Jan 3. Need final approval call before Dec 14 or this pushes to January. Requested calendar hold, waiting on confirmation.
+
+NovaBridge Tech - Maria: Good technical fit, champion engaged, but economic buyer not yet identified. Deal has been in negotiation 21 days with no major movement. Some flight risk given holiday timing.
+
+BluePeak Retail - James: Was tracking well but legal just requested two new data security addenda not in our standard MSA. Adds 10-14 days. Close date moving from Dec 18 to Jan 10.
+
+Vertex Solutions - Darius: CFO who was our champion departed the company Nov 29. New CFO onboarding now, deal effectively restarts. Pulling from Q4 forecast.`;
+
+// ───────────────────────────────────────────────────────────────────────────
+// GENERIC SCORING ENGINE
+// Works on ANY pasted CSV + notes by reading for keyword signals rather
+// than matching specific deal names. This is intentionally rule-based
+// (not an LLM call) so the tool runs free, client-side, with nothing sent
+// to a server. It will be rougher than an AI-read version, but it is
+// real signal extraction, not a canned demo.
+// ───────────────────────────────────────────────────────────────────────────
+
+function parseCSV(text) {
+  const lines = text.trim().split("\n").filter((l) => l.trim().length > 0);
+  if (lines.length < 2) return [];
+  // Split on comma, but tolerate quoted fields minimally
+  const splitLine = (line) => line.split(",").map((c) => c.trim());
+  const headers = splitLine(lines[0]).map((h) => h.toLowerCase());
+  const findCol = (...names) => {
+    for (const n of names) {
+      const idx = headers.findIndex((h) => h.includes(n));
+      if (idx !== -1) return idx;
+    }
+    return -1;
+  };
+  const nameIdx = findCol("deal name", "opportunity", "deal");
+  const arrIdx = findCol("arr", "amount", "value");
+  const stageIdx = findCol("stage");
+  const closeIdx = findCol("close date", "close");
+  const ownerIdx = findCol("owner", "rep", "ae");
+  const activityIdx = findCol("last activity", "activity");
+  const daysIdx = findCol("days in stage", "days");
+
+  return lines.slice(1).map((line) => {
+    const cells = splitLine(line);
+    const get = (idx) => (idx !== -1 && cells[idx] !== undefined ? cells[idx] : "");
+    const rawArr = get(arrIdx).replace(/[^0-9.]/g, "");
+    return {
+      name: get(nameIdx) || "Unnamed deal",
+      arr: parseFloat(rawArr) || 0,
+      stage: get(stageIdx),
+      closeDate: get(closeIdx),
+      owner: get(ownerIdx) || "Unassigned",
+      lastActivity: get(activityIdx),
+      daysInStage: parseInt(get(daysIdx), 10) || null,
+    };
+  }).filter((d) => d.name && d.name !== "Unnamed deal" || d.arr > 0);
+}
+
+// Find the note block most relevant to a given deal name by simple
+// substring / fuzzy matching against the notes text, splitting notes
+// into paragraphs first.
+// Splits notes into per-deal blocks by detecting "header" lines that look
+// like "Deal Name - Rep:" or "Deal Name - Rep: <content...>", whether the
+// content follows on the same line (single-paragraph style) or starts on
+// the next line (multi-section template style). Everything up to the next
+// header line belongs to the current deal, regardless of blank lines.
+function splitIntoDealBlocks(notesText) {
+  if (!notesText) return [];
+  const lines = notesText.split("\n");
+  const blocks = [];
+  let current = { header: "", lines: [] };
+
+  // Matches "Some Deal Name - RepName:" at the start of a line, optionally
+  // followed by more content on the same line.
+  const headerPattern = /^([A-Z][\w&.']+(?:\s+[\w&.']+){0,5}\s*-\s*\w+):\s*(.*)$/;
+
+  const knownFields = ["stakeholders", "budget", "process status", "timeline pressure", "risk flags", "why"];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const lower = trimmed.toLowerCase();
+    const isKnownField = knownFields.some((f) => lower.startsWith(f));
+    const match = !isKnownField ? trimmed.match(headerPattern) : null;
+
+    if (match) {
+      if (current.header || current.lines.some((l) => l.trim())) blocks.push(current);
+      current = { header: match[1], lines: match[2] ? [match[2]] : [] };
+    } else {
+      current.lines.push(line);
+    }
+  }
+  if (current.header || current.lines.some((l) => l.trim())) blocks.push(current);
+
+  return blocks.map((b) => ({ header: b.header, text: (b.header + "\n" + b.lines.join("\n")).trim() }));
+}
+
+function findNoteBlock(notesText, dealName) {
+  if (!notesText || !dealName) return "";
+  const blocks = splitIntoDealBlocks(notesText);
+  const lowerDeal = dealName.toLowerCase();
+  const dealWords = lowerDeal.split(/\s+/).filter((w) => w.length > 3);
+
+  let best = "";
+  let bestScore = 0;
+  for (const block of blocks) {
+    const lowerText = block.text.toLowerCase();
+    let score = 0;
+    if (lowerText.includes(lowerDeal)) score += 10;
+    for (const w of dealWords) {
+      if (lowerText.includes(w)) score += 2;
+    }
+    if (score > bestScore) {
+      bestScore = score;
+      best = block.text;
+    }
+  }
+  return bestScore > 0 ? best.trim() : "";
+}
+
+// Keyword signal banks. Each signal has a weight and a human-readable
+// reason fragment used when constructing the narrative.
+const POSITIVE_SIGNALS = [
+  { kws: ["multi-thread", "multiple stakeholders", "champion and", "cfo and", "economic buyer engaged"], weight: 2, label: "multi-threaded relationship" },
+  { kws: ["verbal commit", "verbally committed", "confirmed budget", "budget approved", "budget confirmed"], weight: 2, label: "budget or verbal commitment confirmed" },
+  { kws: ["mutual action plan", "signed mutual", "mutual close plan"], weight: 2, label: "a signed mutual action plan" },
+  { kws: ["po expected", "po issued", "purchase order", "procurement started", "procurement kicked off"], weight: 2, label: "procurement actively underway" },
+  { kws: ["legal review", "redline", "msa returned", "contract review"], weight: 1, label: "contract review in motion" },
+  { kws: ["champion engaged", "champion is", "strong champion", "champion has"], weight: 1, label: "an engaged champion" },
+  { kws: ["hard deadline", "internal deadline", "board presentation", "go-live"], weight: 1, label: "a hard deadline on the buyer's side" },
+];
+
+const NEGATIVE_SIGNALS = [
+  { kws: ["champion left", "champion departed", "champion is gone", "champion no longer", "point of contact left"], weight: 4, label: "the champion has left the company", riskType: "Champion departure" },
+  { kws: ["went dark", "gone dark", "not responding", "no response", "ghosted", "radio silence"], weight: 3, label: "the contact has gone unresponsive", riskType: "Contact unresponsive" },
+  { kws: ["pushed back", "slipped", "delayed", "moved to next", "moving to q", "pushed to"], weight: 3, label: "the timeline has already slipped once", riskType: "Timeline slippage" },
+  { kws: ["single-threaded", "only contact", "one contact", "no backup contact"], weight: 2, label: "the deal is single-threaded with no backup contact", riskType: "Single-threaded contact" },
+  { kws: ["economic buyer not", "buyer not identified", "no economic buyer", "don't know who signs"], weight: 3, label: "the economic buyer has not been identified", riskType: "Buyer not identified" },
+  { kws: ["competitor", "competing vendor", "also evaluating", "comparing us to"], weight: 2, label: "a competing vendor is still in play", riskType: "Competitive pressure" },
+  { kws: ["legal has not started", "legal hasn't started", "no legal yet", "not in legal yet"], weight: 2, label: "legal review has not yet started", riskType: "Legal delay" },
+  { kws: ["traveling", "out of office", "on leave", "unavailable until"], weight: 2, label: "a key stakeholder is unavailable for a stretch of time", riskType: "Stakeholder availability" },
+  { kws: ["new addenda", "additional requirements", "new requirement", "scope change", "added paperwork"], weight: 2, label: "new requirements have appeared late in the cycle", riskType: "Scope change" },
+  { kws: ["no movement", "no major movement", "stalled", "flat", "no update"], weight: 2, label: "the deal has shown little recent movement", riskType: "Stalled momentum" },
+];
+
+function scoreDeal(deal, noteText) {
+  const lowerNote = (noteText || "").toLowerCase();
+  let posScore = 0;
+  let negScore = 0;
+  const reasons = [];
+  const risks = [];
+
+  for (const sig of POSITIVE_SIGNALS) {
+    if (sig.kws.some((kw) => lowerNote.includes(kw))) {
+      posScore += sig.weight;
+      reasons.push(sig.label);
+    }
+  }
+  for (const sig of NEGATIVE_SIGNALS) {
+    if (sig.kws.some((kw) => lowerNote.includes(kw))) {
+      negScore += sig.weight;
+      risks.push({ label: sig.label, type: sig.riskType, weight: sig.weight });
+    }
+  }
+
+  // Stage-based prior: later stages get a small positive prior
+  const stage = (deal.stage || "").toLowerCase();
+  if (stage.includes("negotiation") || stage.includes("contract")) posScore += 1.5;
+  else if (stage.includes("proposal")) posScore += 0.5;
+  else if (stage.includes("discovery") || stage.includes("qualif")) posScore -= 1;
+
+  // Staleness prior: long time in stage with no notes is a soft risk
+  if (deal.daysInStage !== null && deal.daysInStage >= 25 && reasons.length === 0) {
+    negScore += 1.5;
+    risks.push({ label: "this deal has sat in stage a long time with limited documented signal", type: "Stalled momentum", weight: 1.5 });
+  }
+
+  const netScore = posScore - negScore;
+
+  let category, confidence;
+  if (negScore >= 4 && netScore < 0) {
+    category = "slipped";
+    confidence = "low";
+  } else if (netScore >= 3) {
+    category = "commit";
+    confidence = negScore > 0 ? "medium" : "high";
+  } else if (netScore >= 0.5) {
+    category = "commit";
+    confidence = "medium";
+  } else {
+    category = "upside";
+    confidence = "low";
+  }
+
+  // Highest-weight risk becomes the headline risk for this deal
+  risks.sort((a, b) => b.weight - a.weight);
+  const topRisk = risks[0] || null;
+
+  return {
+    ...deal,
+    category,
+    confidence,
+    reasons,
+    risks,
+    topRisk,
+    hasNotes: (noteText || "").trim().length > 0,
+  };
+}
+
+function buildNarrative(deal) {
+  const name = deal.name;
+  if (!deal.hasNotes) {
+    return {
+      why: "No matching notes were found for this deal in the pasted text. Scoring is based on CRM stage and recency only — treat this as provisional until rep commentary is added.",
+      risk: "Unknown. No qualitative signal available beyond CRM fields.",
+    };
+  }
+
+  let why;
+  if (deal.reasons.length > 0) {
+    why = `Notes indicate ${deal.reasons.slice(0, 3).join(", ")}.`;
+  } else {
+    why = "Notes were found but didn't contain strong positive signal language. Close thesis here is weaker than other deals in this set.";
+  }
+
+  let risk;
+  if (deal.topRisk) {
+    risk = `${deal.topRisk.label.charAt(0).toUpperCase() + deal.topRisk.label.slice(1)}. This is the primary risk flagged from the notes.`;
+    if (deal.risks.length > 1) {
+      risk += ` Additional flags: ${deal.risks.slice(1, 3).map((r) => r.label).join("; ")}.`;
+    }
+  } else {
+    risk = "No major risk language detected in the notes. Continue normal monitoring.";
+  }
+
+  return { why, risk };
+}
+
+function buildReport(csvText, notesText, quota) {
+  const rows = parseCSV(csvText);
+  const deals = rows.map((d) => {
+    const noteBlock = findNoteBlock(notesText, d.name);
+    const scored = scoreDeal(d, noteBlock);
+    const narrative = buildNarrative(scored);
+    return { ...scored, ...narrative };
+  });
+
+  const commit = deals.filter((d) => d.category === "commit");
+  const upside = deals.filter((d) => d.category === "upside");
+  const slipped = deals.filter((d) => d.category === "slipped");
+
+  const commitTotal = commit.reduce((s, d) => s + d.arr, 0);
+  const upsideTotal = upside.reduce((s, d) => s + d.arr, 0);
+  const mostLikelyTotal = commitTotal + upsideTotal;
+
+  const allRisks = deals
+    .filter((d) => d.topRisk)
+    .map((d) => ({ deal: d.name, type: d.topRisk.type, body: d.risk, owner: d.owner, severity: d.topRisk.weight >= 3 ? "high" : "medium" }));
+
+  const gap = quota - commitTotal;
+  const coverage = gap > 0 ? (mostLikelyTotal / gap).toFixed(1) : "—";
+
+  return {
+    quota,
+    commitTotal,
+    mostLikelyTotal,
+    commit,
+    upside,
+    slipped,
+    risks: allRisks,
+    pipelineCoverage: coverage,
+    totalDeals: deals.length,
+    dealsWithNotes: deals.filter((d) => d.hasNotes).length,
+  };
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// FORMATTING HELPERS
+// ───────────────────────────────────────────────────────────────────────────
+
+const fmtMoney = (n) => {
+  if (!n || isNaN(n)) return "$0";
+  if (n >= 1000000) return `$${(n / 1000000).toFixed(2)}M`;
+  if (n >= 1000) return `$${(n / 1000).toFixed(0)}K`;
+  return `$${n}`;
+};
+const fmtDate = (iso) => {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return iso;
+  return d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+};
+
+// ───────────────────────────────────────────────────────────────────────────
+// UI COMPONENTS
+// ───────────────────────────────────────────────────────────────────────────
+
+function Badge({ children, tone }) {
+  const tones = {
+    gray: { background: "#f1f5f9", color: "#64748b" },
+    green: { background: "#f0fdf4", color: "#15803d" },
+    amber: { background: "#fffbeb", color: "#b45309" },
+    red: { background: "#fef2f2", color: "#b91c1c" },
+  };
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", padding: "3px 10px", borderRadius: "6px", fontSize: "12px", fontWeight: 500, whiteSpace: "nowrap", ...tones[tone || "gray"] }}>
+      {children}
+    </span>
+  );
+}
+
+function Header() {
+  return (
+    <div style={{ marginBottom: "1.5rem" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", flexWrap: "wrap", gap: "8px" }}>
+        <h1 style={{ fontSize: "22px", fontWeight: 600, margin: 0 }}>ForecastIQ</h1>
+        <span style={{ fontSize: "12px", color: "#94a3b8" }}>Free &middot; no signup &middot; nothing stored</span>
+      </div>
+      <p style={{ color: "#64748b", fontSize: "14px", marginTop: "6px", marginBottom: 0 }}>
+        Paste your pipeline export and forecast call notes. Get a boardroom-ready forecast defense report — entirely in your browser.
+      </p>
+    </div>
+  );
+}
+
+function InputStep({ csv, setCsv, notes, setNotes, quota, setQuota, onGenerate, loadSample }) {
+  return (
+    <div>
+      <Header />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "20px", marginBottom: "1.25rem" }}>
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
+            <label style={{ fontSize: "13px", fontWeight: 500 }}>CRM export (CSV)</label>
+            <span style={{ fontSize: "12px", color: "#94a3b8" }}>{csv.trim() ? `${Math.max(csv.trim().split("\n").length - 1, 0)} rows` : "empty"}</span>
+          </div>
+          <textarea value={csv} onChange={(e) => setCsv(e.target.value)} placeholder={"Deal Name,ARR,Stage,Close Date,Owner\nAcme Corp,50000,Negotiation,2025-03-15,Jane Doe"}
+            style={{ height: "200px", fontSize: "11px", fontFamily: "ui-monospace, monospace" }} />
+          <p style={{ fontSize: "11px", color: "#94a3b8", marginTop: "4px" }}>
+            Works with any CSV that has columns like deal name, ARR/amount, stage, close date, and owner — header names are matched flexibly.
+          </p>
+        </div>
+        <div>
+          <div style={{ display: "flex", justifyContent: "space-between", marginBottom: "8px" }}>
+            <label style={{ fontSize: "13px", fontWeight: 500 }}>Call notes / rep commentary</label>
+            <span style={{ fontSize: "12px", color: "#94a3b8" }}>{notes.trim() ? `${notes.trim().length.toLocaleString()} chars` : "empty"}</span>
+          </div>
+          <textarea value={notes} onChange={(e) => setNotes(e.target.value)} placeholder={"Acme Corp - Jane: Champion is engaged, budget confirmed. Legal review starts Monday..."}
+            style={{ height: "200px", fontSize: "12px" }} />
+          <p style={{ fontSize: "11px", color: "#94a3b8", marginTop: "4px" }}>
+            Separate notes per deal with a blank line, and mention the deal name near the top of each block so it matches correctly.
+          </p>
+        </div>
+      </div>
+
+      <div style={{ marginBottom: "1.25rem" }}>
+        <label style={{ fontSize: "13px", fontWeight: 500, display: "block", marginBottom: "6px" }}>Quota for this period (optional)</label>
+        <input type="text" value={quota} onChange={(e) => setQuota(e.target.value)} placeholder="e.g. 4200000"
+          style={{ fontSize: "13px", padding: "8px 10px", borderRadius: "8px", border: "1px solid #e2e8f0", background: "#f8fafc", width: "220px" }} />
+      </div>
+
+      <div style={{ display: "flex", gap: "10px", flexWrap: "wrap" }}>
+        <button className="primary" onClick={onGenerate} disabled={!csv.trim()}>Generate forecast defense &#8594;</button>
+        <button onClick={loadSample}>Try with sample data</button>
+        {(csv || notes) && <button onClick={() => { setCsv(""); setNotes(""); }}>Clear</button>}
+      </div>
+
+      <div style={{ marginTop: "2.5rem", paddingTop: "1.5rem", borderTop: "1px solid #f1f5f9" }}>
+        <p style={{ fontSize: "12px", color: "#94a3b8", lineHeight: 1.6, maxWidth: "640px", margin: 0 }}>
+          This free tool runs entirely in your browser using rule-based keyword scoring — nothing is uploaded or stored anywhere.
+          It reads your notes for language patterns (budget confirmed, champion engaged, legal delays, competitive pressure, and
+          so on) to build the narrative. It will be rougher than a full AI read of your notes, but the logic is real and works on
+          your actual deals, not just the sample data.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+function GeneratingStep() {
+  const [phase, setPhase] = useState(0);
+  const phases = ["Parsing CRM export...", "Matching notes to deals...", "Scoring signals...", "Writing the narrative..."];
+  useEffect(() => {
+    if (phase < phases.length - 1) {
+      const t = setTimeout(() => setPhase((p) => p + 1), 380);
+      return () => clearTimeout(t);
+    }
+  }, [phase]);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: "6rem 0" }}>
+      <div style={{ width: 32, height: 32, border: "3px solid #e2e8f0", borderTopColor: "#1e293b", borderRadius: "50%", animation: "spin 0.8s linear infinite", marginBottom: "18px" }} />
+      <style>{`@keyframes spin { to { transform: rotate(360deg); } }`}</style>
+      <p style={{ fontSize: "14px", color: "#64748b" }}>{phases[phase]}</p>
+    </div>
+  );
+}
+
+function MetricCard({ label, value, sub }) {
+  return (
+    <div style={{ background: "#f8fafc", borderRadius: "10px", padding: "14px 16px" }}>
+      <p style={{ fontSize: "12px", color: "#64748b", margin: 0, marginBottom: "4px" }}>{label}</p>
+      <p style={{ fontSize: "19px", fontWeight: 600, margin: 0 }}>{value}</p>
+      {sub && <p style={{ fontSize: "11px", color: "#94a3b8", margin: 0, marginTop: "2px" }}>{sub}</p>}
+    </div>
+  );
+}
+
+function DealCard({ deal }) {
+  const [expanded, setExpanded] = useState(true);
+  const toneMap = { commit: "green", upside: "amber", slipped: "red" };
+  return (
+    <div style={{ border: "1px solid #e2e8f0", borderRadius: "12px", padding: "16px 18px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: expanded ? "12px" : 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
+          <h4 style={{ fontSize: "15px", fontWeight: 600, margin: 0 }}>{deal.name}</h4>
+          <Badge tone={toneMap[deal.category]}>{deal.category === "commit" ? (deal.confidence === "medium" ? "Commit — watch" : "Commit") : deal.category === "upside" ? "Upside" : "Slipped"}</Badge>
+          {!deal.hasNotes && <Badge tone="gray">No notes matched</Badge>}
+        </div>
+        <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
+          <Badge tone="gray">{fmtMoney(deal.arr)}</Badge>
+          {deal.closeDate && <Badge tone="gray">Close: {fmtDate(deal.closeDate)}</Badge>}
+          <button onClick={() => setExpanded((e) => !e)} style={{ border: "none", background: "none", cursor: "pointer", color: "#94a3b8", padding: "2px", fontSize: "12px" }}>{expanded ? "▲" : "▼"}</button>
+        </div>
+      </div>
+      {expanded && (
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+          <div>
+            <p style={{ fontSize: "10.5px", fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.04em", margin: 0, marginBottom: "3px" }}>Why it closes</p>
+            <p style={{ fontSize: "13.5px", lineHeight: 1.6, margin: 0 }}>{deal.why}</p>
+          </div>
+          <div>
+            <p style={{ fontSize: "10.5px", fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.04em", margin: 0, marginBottom: "3px" }}>Risk</p>
+            <p style={{ fontSize: "13.5px", lineHeight: 1.6, margin: 0, color: deal.risks.length === 0 ? "#1e293b" : "#b91c1c" }}>{deal.risk}</p>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function ReportStep({ report, onReset }) {
+  const pctOfQuota = report.quota > 0 ? ((report.commitTotal / report.quota) * 100).toFixed(0) : null;
+  const upsideAmt = report.mostLikelyTotal - report.commitTotal;
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "1.5rem", flexWrap: "wrap", gap: "10px" }}>
+        <div>
+          <h1 style={{ fontSize: "19px", fontWeight: 600, margin: 0 }}>Forecast Defense — Generated Report</h1>
+          <p style={{ fontSize: "13px", color: "#94a3b8", margin: 0, marginTop: "2px" }}>
+            {report.totalDeals} deals analyzed &middot; {report.dealsWithNotes} matched to notes
+          </p>
+        </div>
+        <div style={{ display: "flex", gap: "8px" }} className="no-print">
+          <button onClick={onReset}>New report</button>
+          <button className="primary" onClick={() => window.print()}>Export / Print</button>
+        </div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "10px", marginBottom: "1.75rem" }}>
+        {report.quota > 0 && <MetricCard label="Quota" value={fmtMoney(report.quota)} />}
+        <MetricCard label="Commit" value={fmtMoney(report.commitTotal)} sub={pctOfQuota ? `${pctOfQuota}% of quota` : null} />
+        <MetricCard label="Most likely" value={fmtMoney(report.mostLikelyTotal)} sub={`+${fmtMoney(upsideAmt)} upside`} />
+        {report.quota > 0 && <MetricCard label="Pipeline coverage" value={`${report.pipelineCoverage}x`} sub="on remaining gap" />}
+        <MetricCard label="Deals in commit" value={report.commit.length} />
+      </div>
+
+      <div style={{ marginBottom: "2rem" }}>
+        <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Deal-by-deal breakdown — commit</p>
+        {report.commit.length === 0 && <p style={{ fontSize: "13px", color: "#94a3b8" }}>No deals scored as commit. Check that your notes mention budget, champion engagement, or procurement progress.</p>}
+        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+          {report.commit.map((d, i) => <DealCard key={d.name + i} deal={d} />)}
+        </div>
+      </div>
+
+      {report.upside.length > 0 && (
+        <div style={{ marginBottom: "2rem" }}>
+          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Upside / pipeline</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+            {report.upside.map((d, i) => <DealCard key={d.name + i} deal={d} />)}
+          </div>
+        </div>
+      )}
+
+      {report.slipped.length > 0 && (
+        <div style={{ marginBottom: "2rem" }}>
+          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Flagged as at risk of slipping</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+            {report.slipped.map((d, i) => <DealCard key={d.name + i} deal={d} />)}
+          </div>
+        </div>
+      )}
+
+      {report.risks.length > 0 && (
+        <div style={{ marginBottom: "1rem" }}>
+          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Risk register</p>
+          <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
+            {report.risks.map((r, i) => (
+              <div key={i} style={{ border: "1px solid #e2e8f0", borderLeft: `3px solid ${r.severity === "high" ? "#ef4444" : "#f59e0b"}`, borderRadius: "0 10px 10px 0", padding: "12px 14px" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: "6px", marginBottom: "6px" }}>
+                  <p style={{ fontSize: "13px", fontWeight: 600, margin: 0 }}>{r.deal}</p>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <Badge tone={r.severity === "high" ? "red" : "amber"}>{r.severity === "high" ? "High" : "Medium"}</Badge>
+                    <Badge tone="gray">{r.type}</Badge>
+                  </div>
+                </div>
+                <p style={{ fontSize: "13px", color: "#64748b", lineHeight: 1.6, margin: 0 }}>{r.body}</p>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <p style={{ marginTop: "2.5rem", paddingTop: "1.25rem", borderTop: "1px solid #f1f5f9", fontSize: "12px", color: "#94a3b8" }}>
+        Generated by ForecastIQ (free tier) &middot; rule-based keyword scoring, run entirely in your browser &middot; nothing was uploaded or stored
+      </p>
+    </div>
+  );
+}
+
+function App() {
+  const [step, setStep] = useState(0);
+  const [csv, setCsv] = useState("");
+  const [notes, setNotes] = useState("");
+  const [quota, setQuota] = useState("");
+  const [report, setReport] = useState(null);
+
+  const handleGenerate = () => {
+    setStep(1);
+    setTimeout(() => {
+      const q = parseFloat((quota || "0").replace(/[^0-9.]/g, "")) || 0;
+      setReport(buildReport(csv, notes, q));
+      setStep(2);
+    }, 1500);
+  };
+  const handleReset = () => { setStep(0); setReport(null); };
+  const loadSample = () => { setCsv(SAMPLE_CSV); setNotes(SAMPLE_NOTES); setQuota("4200000"); };
+
+  return (
+    <div>
+      {step === 0 && <InputStep csv={csv} setCsv={setCsv} notes={notes} setNotes={setNotes} quota={quota} setQuota={setQuota} onGenerate={handleGenerate} loadSample={loadSample} />}
+      {step === 1 && <GeneratingStep />}
+      {step === 2 && report && <ReportStep report={report} onReset={handleReset} />}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
