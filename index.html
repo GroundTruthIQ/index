@@ -520,9 +520,47 @@ function ReportStep({ report, onReset }) {
   const pctOfQuota = report.quota > 0 ? ((report.commitTotal / report.quota) * 100).toFixed(0) : null;
   const upsideAmt = report.mostLikelyTotal - report.commitTotal;
 
+  // Build the one-sentence forecast position statement: "We will hit $X
+  // this quarter because these N deals will close, for these reasons, on
+  // these timelines — and here's what would break each one."
+  const commitCount = report.commit.length;
+  const topReasonCounts = {};
+  report.commit.forEach((d) => {
+    (d.reasons || []).forEach((r) => {
+      topReasonCounts[r] = (topReasonCounts[r] || 0) + 1;
+    });
+  });
+  const topReasons = Object.entries(topReasonCounts)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .map(([label]) => label);
+
+  const watchCount = report.commit.filter((d) => d.confidence === "medium").length;
+
+  let positionStatement;
+  if (commitCount === 0) {
+    positionStatement = `No deals currently score as commit. The ${fmtMoney(report.mostLikelyTotal)} in pipeline shown below is upside only — stronger documented signal (confirmed budget, engaged champions, active procurement) is needed before this forecast can be defended as commit.`;
+  } else {
+    const reasonText = topReasons.length > 0
+      ? `for reasons including ${topReasons.join(" and ")}`
+      : "based on stage and timing alone — stronger documented signal would make this easier to defend";
+    const watchText = watchCount > 0
+      ? ` ${watchCount} of these ${watchCount === 1 ? "carries" : "carry"} real, named risk — here's the bottom line on each.`
+      : ` Risk across this set is currently low — here's the bottom line on each.`;
+    positionStatement = `We will hit ${fmtMoney(report.commitTotal)} this quarter because these ${commitCount} deal${commitCount === 1 ? "" : "s"} will close, ${reasonText}, on the timelines detailed below.${watchText}`;
+  }
+
+  // "10-second bottom line" detail: the actual deals by size, largest first,
+  // each paired with its single biggest named risk (or "no major risk flagged").
+  // This is the level of detail a leader needs if pressed on the spot —
+  // not just the thesis sentence, but which deals and what could break them.
+  const bottomLineDeals = [...report.commit]
+    .sort((a, b) => b.arr - a.arr)
+    .slice(0, 7);
+
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "1.5rem", flexWrap: "wrap", gap: "10px" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "1.25rem", flexWrap: "wrap", gap: "10px" }}>
         <div>
           <h1 style={{ fontSize: "19px", fontWeight: 600, margin: 0 }}>Forecast Defense — Generated Report</h1>
           <p style={{ fontSize: "13px", color: "#94a3b8", margin: 0, marginTop: "2px" }}>
@@ -533,6 +571,41 @@ function ReportStep({ report, onReset }) {
           <button onClick={onReset}>New report</button>
           <button className="primary" onClick={() => window.print()}>Export / Print</button>
         </div>
+      </div>
+
+      <div style={{
+        background: "#1e293b",
+        borderRadius: "12px",
+        padding: "18px 20px",
+        marginBottom: "1.5rem",
+      }}>
+        <p style={{ fontSize: "10.5px", fontWeight: 600, color: "#5eead4", textTransform: "uppercase", letterSpacing: "0.06em", margin: 0, marginBottom: "8px" }}>
+          Forecast position — the 10-second version
+        </p>
+        <p style={{ fontSize: "15px", color: "#ffffff", lineHeight: 1.6, margin: 0, marginBottom: bottomLineDeals.length > 0 ? "14px" : 0, fontWeight: 500 }}>
+          {positionStatement}
+        </p>
+
+        {bottomLineDeals.length > 0 && (
+          <div style={{ borderTop: "1px solid #334155", paddingTop: "12px", display: "flex", flexDirection: "column", gap: "7px" }}>
+            {bottomLineDeals.map((d, i) => {
+              const riskText = d.topRisk
+                ? d.topRisk.label.charAt(0).toUpperCase() + d.topRisk.label.slice(1)
+                : "No major risk flagged";
+              return (
+                <div key={d.name + i} style={{ display: "flex", gap: "10px", fontSize: "13px", lineHeight: 1.5 }}>
+                  <span style={{ color: "#5eead4", fontWeight: 600, minWidth: "62px" }}>{fmtMoney(d.arr)}</span>
+                  <span style={{ color: "#e2e8f0" }}>
+                    <strong style={{ color: "#ffffff" }}>{d.name}</strong>
+                    {d.closeDate && <span style={{ color: "#94a3b8" }}> &middot; closes {fmtDate(d.closeDate)}</span>}
+                    <span style={{ color: "#94a3b8" }}> &middot; breaks if: </span>
+                    <span style={{ color: d.topRisk ? "#fca5a5" : "#94a3b8" }}>{riskText}</span>
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "10px", marginBottom: "1.75rem" }}>
