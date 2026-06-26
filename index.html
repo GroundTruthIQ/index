@@ -99,29 +99,108 @@ Vertex Solutions - Darius: CFO who was our champion departed the company Nov 29.
 // real signal extraction, not a canned demo.
 // ───────────────────────────────────────────────────────────────────────────
 
+// A minimal but correct delimited-text parser that respects quoted fields.
+// This matters a lot in practice: real CRM exports routinely have free-text
+// columns (notes, decision criteria, coaching comments) that contain commas,
+// and a naive line.split(",") silently shifts every later column on that
+// row, scrambling the data without any visible error. This parser walks the
+// text character by character so quoted delimiters and quoted newlines are
+// treated as part of the field, not as separators.
+//
+// It also accepts a `delimiter` argument because pasted data isn't always
+// comma-separated even when it came from a ".csv" file: copying cells out
+// of Excel, Google Sheets, or Numbers and pasting as plain text commonly
+// puts the clipboard content in TAB-separated form, regardless of the
+// original file's delimiter. Detecting and using the real delimiter avoids
+// silently treating an entire row as one giant unmatched field.
+function parseCSVRows(text, delimiter) {
+  const rows = [];
+  let row = [];
+  let field = "";
+  let inQuotes = false;
+  let i = 0;
+  const n = text.length;
+
+  while (i < n) {
+    const ch = text[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { field += '"'; i += 2; continue; }
+        inQuotes = false; i++; continue;
+      }
+      field += ch; i++; continue;
+    } else {
+      if (ch === '"') { inQuotes = true; i++; continue; }
+      if (ch === delimiter) { row.push(field); field = ""; i++; continue; }
+      if (ch === "\r") { i++; continue; }
+      if (ch === "\n") {
+        row.push(field); field = "";
+        if (row.some((c) => c.trim().length > 0)) rows.push(row);
+        row = []; i++; continue;
+      }
+      field += ch; i++; continue;
+    }
+  }
+  // Flush the last field/row if the text didn't end with a newline.
+  if (field.length > 0 || row.length > 0) {
+    row.push(field);
+    if (row.some((c) => c.trim().length > 0)) rows.push(row);
+  }
+  return rows.map((r) => r.map((c) => c.trim()));
+}
+
+// Looks at the first non-empty line of the pasted text and decides whether
+// it's more likely tab-separated or comma-separated, by counting how many
+// of each delimiter appear outside quotes. Spreadsheet copy-paste is
+// virtually always tabs; an actual exported .csv file's contents is commas.
+function detectDelimiter(text) {
+  const firstLine = (text.split("\n").find((l) => l.trim().length > 0) || "");
+  const tabCount = (firstLine.match(/\t/g) || []).length;
+  const commaCount = (firstLine.match(/,/g) || []).length;
+  return tabCount > commaCount ? "\t" : ",";
+}
+
 function parseCSV(text) {
-  const lines = text.trim().split("\n").filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return [];
-  // Split on comma, but tolerate quoted fields minimally
-  const splitLine = (line) => line.split(",").map((c) => c.trim());
-  const headers = splitLine(lines[0]).map((h) => h.toLowerCase());
+  const delimiter = detectDelimiter(text);
+  const allRows = parseCSVRows(text, delimiter);
+  if (allRows.length < 2) return [];
+  const headerRow = allRows[0];
+  const headers = headerRow.map((h) => h.toLowerCase());
+
+  // Finds the column matching a preferred name, skipping any header that
+  // looks like an identifier column (ends in "id" / "#" / "number") since
+  // those should never be picked for a human-readable field like deal name.
   const findCol = (...names) => {
+    const isIdLike = (h) => /\bid\b|\bnumber\b|#\s*$/.test(h);
+    for (const n of names) {
+      const idx = headers.findIndex((h) => h.includes(n) && !isIdLike(h));
+      if (idx !== -1) return idx;
+    }
+    // Fall back to allowing ID-like columns only if nothing else matched at all
     for (const n of names) {
       const idx = headers.findIndex((h) => h.includes(n));
       if (idx !== -1) return idx;
     }
     return -1;
   };
-  const nameIdx = findCol("deal name", "opportunity", "deal");
+  // "name" and "opportunity name" / "deal name" are checked before the bare
+  // "opportunity" / "deal" fallback, so a real Salesforce export with both
+  // "Opportunity ID" and "Opportunity Name" columns picks the name column.
+  const nameIdx = findCol("opportunity name", "deal name", "name", "opportunity", "deal");
   const arrIdx = findCol("arr", "amount", "value");
   const stageIdx = findCol("stage");
   const closeIdx = findCol("close date", "close");
   const ownerIdx = findCol("owner", "rep", "ae");
   const activityIdx = findCol("last activity", "activity");
   const daysIdx = findCol("days in stage", "days");
+  // Many real CRM exports already include the rep or manager's own forecast
+  // judgment (Commit / Best Case / Pipeline, or similar) and a risk rating.
+  // When present, this is a stronger signal than anything we can infer from
+  // free-text notes alone, so it's captured here and given priority in scoring.
+  const forecastCatIdx = findCol("forecast category", "forecast cat");
+  const riskLevelIdx = findCol("risk level", "risk rating");
 
-  return lines.slice(1).map((line) => {
-    const cells = splitLine(line);
+  return allRows.slice(1).map((cells) => {
     const get = (idx) => (idx !== -1 && cells[idx] !== undefined ? cells[idx] : "");
     const rawArr = get(arrIdx).replace(/[^0-9.]/g, "");
     return {
@@ -132,6 +211,8 @@ function parseCSV(text) {
       owner: get(ownerIdx) || "Unassigned",
       lastActivity: get(activityIdx),
       daysInStage: parseInt(get(daysIdx), 10) || null,
+      crmForecastCategory: get(forecastCatIdx) || "",
+      crmRiskLevel: get(riskLevelIdx) || "",
     };
   }).filter((d) => d.name && d.name !== "Unnamed deal" || d.arr > 0);
 }
@@ -139,39 +220,82 @@ function parseCSV(text) {
 // Find the note block most relevant to a given deal name by simple
 // substring / fuzzy matching against the notes text, splitting notes
 // into paragraphs first.
-// Splits notes into per-deal blocks by detecting "header" lines that look
-// like "Deal Name - Rep:" or "Deal Name - Rep: <content...>", whether the
-// content follows on the same line (single-paragraph style) or starts on
-// the next line (multi-section template style). Everything up to the next
-// header line belongs to the current deal, regardless of blank lines.
+// Splits notes into per-deal blocks. Real-world note exports vary a lot in
+// format, so this looks for any of several common patterns, in order:
+//   1. A long separator line (====, ----, ____, etc, repeated 8+ times) —
+//      treated as a hard boundary between deals regardless of what's on it.
+//   2. A labeled header line like "Opportunity: <name>", "Deal: <name>",
+//      or "Account: <name>" — common in CRM-style exports.
+//   3. The original "<Deal Name> - <Rep>:" inline style, with content
+//      optionally following on the same line.
+// Whichever pattern fires first for a given block of text is used; once a
+// boundary is found, everything until the next boundary belongs to that deal.
 function splitIntoDealBlocks(notesText) {
   if (!notesText) return [];
   const lines = notesText.split("\n");
   const blocks = [];
   let current = { header: "", lines: [] };
+  let currentStartedByLabel = false;
 
-  // Matches "Some Deal Name - RepName:" at the start of a line, optionally
-  // followed by more content on the same line.
-  const headerPattern = /^([A-Z][\w&.']+(?:\s+[\w&.']+){0,5}\s*-\s*\w+):\s*(.*)$/;
-
+  const separatorPattern = /^[=\-_*]{8,}\s*$/;
+  const labeledHeaderPattern = /^(?:opportunity|deal|account)\s*:\s*(.+)$/i;
+  const inlineHeaderPattern = /^([A-Z][\w&.']+(?:\s+[\w&.']+){0,5}\s*-\s*\w+):\s*(.*)$/;
   const knownFields = ["stakeholders", "budget", "process status", "timeline pressure", "risk flags", "why"];
+
+  const pushCurrent = () => {
+    if (current.header || current.lines.some((l) => l.trim())) blocks.push(current);
+  };
 
   for (const line of lines) {
     const trimmed = line.trim();
     const lower = trimmed.toLowerCase();
-    const isKnownField = knownFields.some((f) => lower.startsWith(f));
-    const match = !isKnownField ? trimmed.match(headerPattern) : null;
 
-    if (match) {
-      if (current.header || current.lines.some((l) => l.trim())) blocks.push(current);
-      current = { header: match[1], lines: match[2] ? [match[2]] : [] };
-    } else {
-      current.lines.push(line);
+    // Hard separator: close out the current block, but don't start a new
+    // header yet — the next real header line (often a few lines later,
+    // e.g. "Opportunity: ...") will do that.
+    if (separatorPattern.test(trimmed)) {
+      pushCurrent();
+      current = { header: "", lines: [] };
+      currentStartedByLabel = false;
+      continue;
     }
-  }
-  if (current.header || current.lines.some((l) => l.trim())) blocks.push(current);
 
-  return blocks.map((b) => ({ header: b.header, text: (b.header + "\n" + b.lines.join("\n")).trim() }));
+    const labeledMatch = trimmed.match(labeledHeaderPattern);
+    if (labeledMatch) {
+      // Only treat "Opportunity:" / "Deal:" / "Account:" as the start of a
+      // new deal if the current block doesn't already have a labeled
+      // header — this avoids a later "Account:" line inside a block that
+      // already started with "Opportunity:" being mistaken for a new deal.
+      // It does NOT block a fresh inline header from starting a new block
+      // below, since "Name - Rep:" lines are unambiguous deal boundaries
+      // even when the previous block also had a label-based header.
+      if (!currentStartedByLabel) {
+        pushCurrent();
+        current = { header: labeledMatch[1].trim(), lines: [] };
+        currentStartedByLabel = true;
+        continue;
+      } else {
+        current.lines.push(line);
+        continue;
+      }
+    }
+
+    const isKnownField = knownFields.some((f) => lower.startsWith(f));
+    const inlineMatch = !isKnownField ? trimmed.match(inlineHeaderPattern) : null;
+    if (inlineMatch) {
+      pushCurrent();
+      current = { header: inlineMatch[1], lines: inlineMatch[2] ? [inlineMatch[2]] : [] };
+      currentStartedByLabel = false;
+      continue;
+    }
+
+    current.lines.push(line);
+  }
+  pushCurrent();
+
+  return blocks
+    .map((b) => ({ header: b.header, text: (b.header + "\n" + b.lines.join("\n")).trim() }))
+    .filter((b) => b.text.length > 0);
 }
 
 function findNoteBlock(notesText, dealName) {
@@ -182,19 +306,36 @@ function findNoteBlock(notesText, dealName) {
 
   let best = "";
   let bestScore = 0;
+  let bestWordsMatched = 0;
   for (const block of blocks) {
     const lowerText = block.text.toLowerCase();
     let score = 0;
+    let wordsMatched = 0;
     if (lowerText.includes(lowerDeal)) score += 10;
     for (const w of dealWords) {
-      if (lowerText.includes(w)) score += 2;
+      if (lowerText.includes(w)) { score += 2; wordsMatched++; }
     }
     if (score > bestScore) {
       bestScore = score;
+      bestWordsMatched = wordsMatched;
       best = block.text;
     }
   }
-  return bestScore > 0 ? best.trim() : "";
+
+  // Require either an exact (verbatim) match of the deal name, or most of
+  // its distinct words to be present — a couple of incidentally shared
+  // words (e.g. two unrelated deals both mentioning "Edge" or "Network")
+  // should not count as a real match. Without this, deals get silently
+  // paired with the wrong notes block, or with another deal's notes
+  // entirely, which produces a confidently wrong report rather than an
+  // honest "no notes found."
+  const exactMatch = dealWords.length > 0 && new RegExp(
+    lowerDeal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+  ).test(best.toLowerCase());
+  const enoughWordsMatched = dealWords.length > 0 && bestWordsMatched / dealWords.length >= 0.6;
+
+  if (!exactMatch && !enoughWordsMatched) return "";
+  return best.trim();
 }
 
 // Keyword signal banks. Each signal has a weight and a human-readable
@@ -221,6 +362,20 @@ const NEGATIVE_SIGNALS = [
   { kws: ["new addenda", "additional requirements", "new requirement", "scope change", "added paperwork"], weight: 2, label: "new requirements have appeared late in the cycle", riskType: "Scope change" },
   { kws: ["no movement", "no major movement", "stalled", "flat", "no update"], weight: 2, label: "the deal has shown little recent movement", riskType: "Stalled momentum" },
 ];
+
+// Maps common CRM forecast category labels to our three internal buckets.
+// Different CRMs use different words for the same concept (Commit / Best
+// Case / Pipeline is one common convention; Closed/Committed/Upside/Omitted
+// is another), so this is intentionally a bit generous in what it matches.
+function mapCrmCategory(rawCategory) {
+  const c = (rawCategory || "").toLowerCase().trim();
+  if (!c) return null;
+  if (/commit/.test(c)) return "commit";
+  if (/best case|upside|most likely/.test(c)) return "upside";
+  if (/pipeline|omitted|exclude|long.?shot/.test(c)) return "upside";
+  if (/slip|lost|closed.?lost|dead/.test(c)) return "slipped";
+  return null;
+}
 
 function scoreDeal(deal, noteText) {
   const lowerNote = (noteText || "").toLowerCase();
@@ -254,21 +409,42 @@ function scoreDeal(deal, noteText) {
     risks.push({ label: "this deal has sat in stage a long time with limited documented signal", type: "Stalled momentum", weight: 1.5 });
   }
 
+  // If the CRM export already includes the rep or manager's own forecast
+  // judgment, treat that as authoritative for the category — it reflects
+  // real human judgment we have no business overriding from keyword
+  // matching alone. Notes-derived scoring still determines confidence
+  // (high/medium) within that category and still surfaces named risks,
+  // so a "Commit" deal with a glaring risk in the notes still gets flagged
+  // as "Commit — watch" rather than silently treated as fully safe.
+  const crmCategory = mapCrmCategory(deal.crmForecastCategory);
   const netScore = posScore - negScore;
+  let category, confidence, categorySource;
 
-  let category, confidence;
-  if (negScore >= 4 && netScore < 0) {
-    category = "slipped";
-    confidence = "low";
-  } else if (netScore >= 3) {
-    category = "commit";
-    confidence = negScore > 0 ? "medium" : "high";
-  } else if (netScore >= 0.5) {
-    category = "commit";
-    confidence = "medium";
+  if (crmCategory) {
+    category = crmCategory;
+    categorySource = "crm";
+    if (category === "commit") {
+      confidence = negScore >= 2 ? "medium" : "high";
+    } else if (category === "slipped") {
+      confidence = "low";
+    } else {
+      confidence = netScore >= 1 ? "medium" : "low";
+    }
   } else {
-    category = "upside";
-    confidence = "low";
+    categorySource = "inferred";
+    if (negScore >= 4 && netScore < 0) {
+      category = "slipped";
+      confidence = "low";
+    } else if (netScore >= 3) {
+      category = "commit";
+      confidence = negScore > 0 ? "medium" : "high";
+    } else if (netScore >= 0.5) {
+      category = "commit";
+      confidence = "medium";
+    } else {
+      category = "upside";
+      confidence = "low";
+    }
   }
 
   // Highest-weight risk becomes the headline risk for this deal
@@ -279,6 +455,7 @@ function scoreDeal(deal, noteText) {
     ...deal,
     category,
     confidence,
+    categorySource,
     reasons,
     risks,
     topRisk,
