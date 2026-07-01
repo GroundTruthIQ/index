@@ -463,33 +463,114 @@ function scoreDeal(deal, noteText) {
   };
 }
 
+// ─── DEAL SIGNAL CLASSIFICATION ────────────────────────────────────────────
+// Maps detected signals to human-readable deal health language used in the
+// "Why it closes," "Why now," "Who signs," and risk sections of each card.
+
+const SIGNAL_TO_WHY = {
+  "multi-threaded relationship": "multi-threaded across key stakeholders",
+  "budget or verbal commitment confirmed": "budget confirmed and commitment given",
+  "a signed mutual action plan": "mutual action plan in place",
+  "procurement actively underway": "procurement underway",
+  "contract review in motion": "contract in review",
+  "an engaged champion": "champion actively engaged",
+  "a hard deadline on the buyer's side": "buyer-side deadline creating real urgency",
+};
+
+const SIGNAL_TO_WHY_NOW = {
+  "a hard deadline on the buyer's side": "buyer has an internal deadline that makes this time-sensitive",
+  "procurement actively underway": "procurement is live — buying process is moving",
+  "contract review in motion": "contract is in active review, close is within reach",
+  "budget or verbal commitment confirmed": "budget is confirmed, financial decision is made",
+};
+
+const RISK_TO_BREAKSTATEMENT = {
+  "Champion departure": "the champion leaves or loses internal authority",
+  "Contact unresponsive": "the contact stays dark — momentum is already stalled",
+  "Timeline slippage": "this slips again, which has already happened once",
+  "Single-threaded contact": "the single contact goes quiet with no backup in place",
+  "Buyer not identified": "we can't get the economic buyer to the table before close",
+  "Competitive pressure": "the competing vendor wins the evaluation",
+  "Legal delay": "legal doesn't engage in time to complete the process",
+  "Stakeholder availability": "key decision-maker is unavailable during the critical window",
+  "Scope change": "new requirements extend the process beyond the close date",
+  "Stalled momentum": "nothing changes — deals with no movement rarely accelerate on their own",
+};
+
+// Maps the set of negative signals on a deal to a GREEN / YELLOW / RED
+// health rating that reflects the execution-theme heatmap concept without
+// making the UI feel like an interrogation.
+function dealHealthRating(deal) {
+  const negCount = deal.risks.length;
+  const hasHighRisk = deal.risks.some((r) => r.weight >= 3);
+  const hasBuyerGap = deal.risks.some((r) => r.type === "Buyer not identified");
+  const hasGhosted = deal.risks.some((r) => r.type === "Contact unresponsive");
+
+  if (hasGhosted || hasBuyerGap || negCount >= 3) return "red";
+  if (hasHighRisk || negCount >= 2) return "yellow";
+  return "green";
+}
+
 function buildNarrative(deal) {
-  const name = deal.name;
   if (!deal.hasNotes) {
     return {
-      why: "No matching notes were found for this deal in the pasted text. Scoring is based on CRM stage and recency only — treat this as provisional until rep commentary is added.",
-      risk: "Unknown. No qualitative signal available beyond CRM fields.",
+      whyItCloses: "No notes matched for this deal. Close thesis is based on CRM stage only — add rep commentary to make this defensible.",
+      whyNow: "No urgency signal detected. Without a documented \"why now,\" this timeline should be treated as aspirational.",
+      whoSigns: "Economic buyer not documented in notes.",
+      breakStatement: "No qualitative signal available. This deal cannot be defended as commit without rep commentary.",
     };
   }
 
-  let why;
+  // WHY IT CLOSES — built from positive signals found in notes
+  let whyItCloses;
   if (deal.reasons.length > 0) {
-    why = `Notes indicate ${deal.reasons.slice(0, 3).join(", ")}.`;
+    const mapped = deal.reasons.slice(0, 3).map((r) => SIGNAL_TO_WHY[r] || r);
+    whyItCloses = `${mapped.slice(0, -1).join(", ")}${mapped.length > 1 ? ", and " : ""}${mapped[mapped.length - 1]}.`;
+    whyItCloses = whyItCloses.charAt(0).toUpperCase() + whyItCloses.slice(1);
   } else {
-    why = "Notes were found but didn't contain strong positive signal language. Close thesis here is weaker than other deals in this set.";
+    whyItCloses = "No strong close signals detected in notes. If this is a commit, the rep should document budget confirmation, champion strength, or active procurement.";
   }
 
-  let risk;
+  // WHY NOW — looks for urgency signals specifically
+  let whyNow = null;
+  for (const [sig, text] of Object.entries(SIGNAL_TO_WHY_NOW)) {
+    if (deal.reasons.includes(sig.replace(SIGNAL_TO_WHY[sig], sig))) break;
+  }
+  // Check for urgency signals directly from the raw reasons list
+  const urgencySignal = deal.reasons.find((r) =>
+    r.includes("deadline") || r.includes("procurement") || r.includes("contract") || r.includes("budget")
+  );
+  if (urgencySignal) {
+    whyNow = SIGNAL_TO_WHY_NOW[urgencySignal] || `Urgency is supported by: ${urgencySignal}.`;
+  } else if (deal.risks.some((r) => r.type === "Stalled momentum")) {
+    whyNow = "No urgency signal detected — and the deal shows signs of stalling. Without a compelling event, this close date is at risk.";
+  } else {
+    whyNow = deal.closeDate
+      ? `Close date is ${fmtDate(deal.closeDate)}. No specific urgency trigger detected in notes — confirm what changes for the buyer if this slips.`
+      : "No urgency signal detected in notes. Confirm what event or deadline makes this quarter's close real.";
+  }
+
+  // WHO SIGNS — looks for explicit economic buyer language
+  const hasBuyer = deal.reasons.includes("multi-threaded relationship") ||
+    !(deal.risks.some((r) => r.type === "Buyer not identified"));
+  const whoSigns = hasBuyer
+    ? "Economic buyer appears to be engaged based on notes. Confirm name and title are documented in the CRM."
+    : "Economic buyer not identified in notes. This is the single biggest risk to closing on time — get them on a call.";
+
+  // WHAT BREAKS IT — primary risk stated as a crisp break statement
+  let breakStatement;
   if (deal.topRisk) {
-    risk = `${deal.topRisk.label.charAt(0).toUpperCase() + deal.topRisk.label.slice(1)}. This is the primary risk flagged from the notes.`;
+    const breakText = RISK_TO_BREAKSTATEMENT[deal.topRisk.type] || deal.topRisk.label;
+    breakStatement = `This deal breaks if ${breakText}.`;
     if (deal.risks.length > 1) {
-      risk += ` Additional flags: ${deal.risks.slice(1, 3).map((r) => r.label).join("; ")}.`;
+      const secondary = deal.risks.slice(1, 3).map((r) => RISK_TO_BREAKSTATEMENT[r.type] || r.label).join("; ");
+      breakStatement += ` Secondary risks: ${secondary}.`;
     }
   } else {
-    risk = "No major risk language detected in the notes. Continue normal monitoring.";
+    breakStatement = "No material risk flags detected in notes. Continue monitoring for activity gaps or stakeholder changes.";
   }
 
-  return { why, risk };
+  return { whyItCloses, whyNow, whoSigns, breakStatement };
 }
 
 function buildReport(csvText, notesText, quota) {
@@ -498,7 +579,8 @@ function buildReport(csvText, notesText, quota) {
     const noteBlock = findNoteBlock(notesText, d.name);
     const scored = scoreDeal(d, noteBlock);
     const narrative = buildNarrative(scored);
-    return { ...scored, ...narrative };
+    const health = dealHealthRating(scored);
+    return { ...scored, ...narrative, health };
   });
 
   const commit = deals.filter((d) => d.category === "commit");
@@ -509,9 +591,21 @@ function buildReport(csvText, notesText, quota) {
   const upsideTotal = upside.reduce((s, d) => s + d.arr, 0);
   const mostLikelyTotal = commitTotal + upsideTotal;
 
+  // Hope pipeline detection: deals in commit with low confidence and no urgency
+  const hopePipeline = commit.filter((d) =>
+    d.confidence === "medium" && !d.reasons.some((r) => r.includes("deadline") || r.includes("procurement") || r.includes("budget"))
+  );
+
   const allRisks = deals
     .filter((d) => d.topRisk)
-    .map((d) => ({ deal: d.name, type: d.topRisk.type, body: d.risk, owner: d.owner, severity: d.topRisk.weight >= 3 ? "high" : "medium" }));
+    .map((d) => ({
+      deal: d.name,
+      type: d.topRisk.type,
+      body: d.breakStatement,
+      owner: d.owner,
+      health: d.health,
+      severity: d.topRisk.weight >= 3 ? "high" : "medium",
+    }));
 
   const gap = quota - commitTotal;
   const coverage = gap > 0 ? (mostLikelyTotal / gap).toFixed(1) : "—";
@@ -524,6 +618,7 @@ function buildReport(csvText, notesText, quota) {
     upside,
     slipped,
     risks: allRisks,
+    hopePipeline,
     pipelineCoverage: coverage,
     totalDeals: deals.length,
     dealsWithNotes: deals.filter((d) => d.hasNotes).length,
@@ -660,32 +755,64 @@ function MetricCard({ label, value, sub }) {
   );
 }
 
+function HealthDot({ health }) {
+  const cfg = {
+    green: { color: "#15803d", bg: "#f0fdf4", border: "#bbf7d0", label: "Defensible" },
+    yellow: { color: "#b45309", bg: "#fffbeb", border: "#fde68a", label: "At risk" },
+    red: { color: "#b91c1c", bg: "#fef2f2", border: "#fecaca", label: "Pipeline fiction" },
+  };
+  const c = cfg[health] || cfg.yellow;
+  return (
+    <span style={{ display: "inline-flex", alignItems: "center", gap: "5px", padding: "3px 10px", borderRadius: "6px", fontSize: "11.5px", fontWeight: 600, background: c.bg, color: c.color, border: `1px solid ${c.border}` }}>
+      <span style={{ width: "7px", height: "7px", borderRadius: "50%", background: c.color, display: "inline-block" }} />
+      {c.label}
+    </span>
+  );
+}
+
 function DealCard({ deal }) {
   const [expanded, setExpanded] = useState(true);
   const toneMap = { commit: "green", upside: "amber", slipped: "red" };
+  const label = deal.category === "commit"
+    ? (deal.confidence === "medium" ? "Commit — watch" : "Commit")
+    : deal.category === "upside" ? "Best case" : "At risk of slipping";
+
   return (
-    <div style={{ border: "1px solid #e2e8f0", borderRadius: "12px", padding: "16px 18px" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", marginBottom: expanded ? "12px" : 0 }}>
+    <div style={{ border: "1px solid #e2e8f0", borderRadius: "12px", overflow: "hidden" }}>
+      {/* Card header */}
+      <div style={{ padding: "14px 16px", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: "8px", background: "#f8fafc", borderBottom: expanded ? "1px solid #e2e8f0" : "none" }}>
         <div style={{ display: "flex", alignItems: "center", gap: "8px", flexWrap: "wrap" }}>
-          <h4 style={{ fontSize: "15px", fontWeight: 600, margin: 0 }}>{deal.name}</h4>
-          <Badge tone={toneMap[deal.category]}>{deal.category === "commit" ? (deal.confidence === "medium" ? "Commit — watch" : "Commit") : deal.category === "upside" ? "Upside" : "Slipped"}</Badge>
+          <h4 style={{ fontSize: "14px", fontWeight: 600, margin: 0 }}>{deal.name}</h4>
+          <Badge tone={toneMap[deal.category]}>{label}</Badge>
+          <HealthDot health={deal.health} />
           {!deal.hasNotes && <Badge tone="gray">No notes matched</Badge>}
         </div>
         <div style={{ display: "flex", gap: "6px", alignItems: "center" }}>
           <Badge tone="gray">{fmtMoney(deal.arr)}</Badge>
-          {deal.closeDate && <Badge tone="gray">Close: {fmtDate(deal.closeDate)}</Badge>}
+          {deal.closeDate && <Badge tone="gray">Closes {fmtDate(deal.closeDate)}</Badge>}
+          {deal.owner && <Badge tone="gray">{deal.owner}</Badge>}
           <button onClick={() => setExpanded((e) => !e)} style={{ border: "none", background: "none", cursor: "pointer", color: "#94a3b8", padding: "2px", fontSize: "12px" }}>{expanded ? "▲" : "▼"}</button>
         </div>
       </div>
+
+      {/* Card body */}
       {expanded && (
-        <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
+        <div style={{ padding: "14px 16px", display: "grid", gridTemplateColumns: "1fr 1fr", gap: "14px" }}>
           <div>
-            <p style={{ fontSize: "10.5px", fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.04em", margin: 0, marginBottom: "3px" }}>Why it closes</p>
-            <p style={{ fontSize: "13.5px", lineHeight: 1.6, margin: 0 }}>{deal.why}</p>
+            <p style={{ fontSize: "10px", fontWeight: 700, color: "#0d9488", textTransform: "uppercase", letterSpacing: "0.06em", margin: 0, marginBottom: "4px" }}>Why it closes</p>
+            <p style={{ fontSize: "13px", lineHeight: 1.6, margin: 0, color: "#1e293b" }}>{deal.whyItCloses}</p>
           </div>
           <div>
-            <p style={{ fontSize: "10.5px", fontWeight: 600, color: "#94a3b8", textTransform: "uppercase", letterSpacing: "0.04em", margin: 0, marginBottom: "3px" }}>Risk</p>
-            <p style={{ fontSize: "13.5px", lineHeight: 1.6, margin: 0, color: deal.risks.length === 0 ? "#1e293b" : "#b91c1c" }}>{deal.risk}</p>
+            <p style={{ fontSize: "10px", fontWeight: 700, color: "#0d9488", textTransform: "uppercase", letterSpacing: "0.06em", margin: 0, marginBottom: "4px" }}>Why now</p>
+            <p style={{ fontSize: "13px", lineHeight: 1.6, margin: 0, color: "#1e293b" }}>{deal.whyNow}</p>
+          </div>
+          <div>
+            <p style={{ fontSize: "10px", fontWeight: 700, color: "#0d9488", textTransform: "uppercase", letterSpacing: "0.06em", margin: 0, marginBottom: "4px" }}>Who signs</p>
+            <p style={{ fontSize: "13px", lineHeight: 1.6, margin: 0, color: "#1e293b" }}>{deal.whoSigns}</p>
+          </div>
+          <div>
+            <p style={{ fontSize: "10px", fontWeight: 700, color: deal.topRisk ? "#b91c1c" : "#64748b", textTransform: "uppercase", letterSpacing: "0.06em", margin: 0, marginBottom: "4px" }}>What breaks it</p>
+            <p style={{ fontSize: "13px", lineHeight: 1.6, margin: 0, color: deal.topRisk ? "#b91c1c" : "#64748b" }}>{deal.breakStatement}</p>
           </div>
         </div>
       )}
@@ -697,9 +824,6 @@ function ReportStep({ report, onReset }) {
   const pctOfQuota = report.quota > 0 ? ((report.commitTotal / report.quota) * 100).toFixed(0) : null;
   const upsideAmt = report.mostLikelyTotal - report.commitTotal;
 
-  // Build the one-sentence forecast position statement: "We will hit $X
-  // this quarter because these N deals will close, for these reasons, on
-  // these timelines — and here's what would break each one."
   const commitCount = report.commit.length;
   const topReasonCounts = {};
   report.commit.forEach((d) => {
@@ -716,27 +840,24 @@ function ReportStep({ report, onReset }) {
 
   let positionStatement;
   if (commitCount === 0) {
-    positionStatement = `No deals currently score as commit. The ${fmtMoney(report.mostLikelyTotal)} in pipeline shown below is upside only — stronger documented signal (confirmed budget, engaged champions, active procurement) is needed before this forecast can be defended as commit.`;
+    positionStatement = `No deals currently score as commit. The ${fmtMoney(report.mostLikelyTotal)} in pipeline shown below is upside only — confirmed budget, an engaged economic buyer, and active procurement are needed before any deal can be defended as commit.`;
   } else {
     const reasonText = topReasons.length > 0
       ? `for reasons including ${topReasons.join(" and ")}`
-      : "based on stage and timing alone — stronger documented signal would make this easier to defend";
+      : "based on stage and timing — add rep commentary to make this more defensible";
     const watchText = watchCount > 0
-      ? ` ${watchCount} of these ${watchCount === 1 ? "carries" : "carry"} real, named risk — here's the bottom line on each.`
-      : ` Risk across this set is currently low — here's the bottom line on each.`;
+      ? ` ${watchCount} of these ${watchCount === 1 ? "carries" : "carry"} named risk — see the bottom line and deal cards below.`
+      : ` Risk across this set is documented and manageable.`;
     positionStatement = `We will hit ${fmtMoney(report.commitTotal)} this quarter because these ${commitCount} deal${commitCount === 1 ? "" : "s"} will close, ${reasonText}, on the timelines detailed below.${watchText}`;
   }
 
-  // "10-second bottom line" detail: the actual deals by size, largest first,
-  // each paired with its single biggest named risk (or "no major risk flagged").
-  // This is the level of detail a leader needs if pressed on the spot —
-  // not just the thesis sentence, but which deals and what could break them.
   const bottomLineDeals = [...report.commit]
     .sort((a, b) => b.arr - a.arr)
     .slice(0, 7);
 
   return (
     <div>
+      {/* Report header */}
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: "1.25rem", flexWrap: "wrap", gap: "10px" }}>
         <div>
           <h1 style={{ fontSize: "19px", fontWeight: 600, margin: 0 }}>Forecast Defense — Generated Report</h1>
@@ -750,33 +871,29 @@ function ReportStep({ report, onReset }) {
         </div>
       </div>
 
-      <div style={{
-        background: "#1e293b",
-        borderRadius: "12px",
-        padding: "18px 20px",
-        marginBottom: "1.5rem",
-      }}>
+      {/* Forecast position block */}
+      <div style={{ background: "#1e293b", borderRadius: "12px", padding: "18px 20px", marginBottom: "1.5rem" }}>
         <p style={{ fontSize: "10.5px", fontWeight: 600, color: "#5eead4", textTransform: "uppercase", letterSpacing: "0.06em", margin: 0, marginBottom: "8px" }}>
           Forecast position — the 10-second version
         </p>
         <p style={{ fontSize: "15px", color: "#ffffff", lineHeight: 1.6, margin: 0, marginBottom: bottomLineDeals.length > 0 ? "14px" : 0, fontWeight: 500 }}>
           {positionStatement}
         </p>
-
         {bottomLineDeals.length > 0 && (
           <div style={{ borderTop: "1px solid #334155", paddingTop: "12px", display: "flex", flexDirection: "column", gap: "7px" }}>
             {bottomLineDeals.map((d, i) => {
-              const riskText = d.topRisk
-                ? d.topRisk.label.charAt(0).toUpperCase() + d.topRisk.label.slice(1)
-                : "No major risk flagged";
+              const healthColor = d.health === "green" ? "#86efac" : d.health === "red" ? "#fca5a5" : "#fde68a";
+              const breakText = d.topRisk
+                ? RISK_TO_BREAKSTATEMENT[d.topRisk.type] || d.topRisk.label
+                : "no material risk flagged";
               return (
-                <div key={d.name + i} style={{ display: "flex", gap: "10px", fontSize: "13px", lineHeight: 1.5 }}>
-                  <span style={{ color: "#5eead4", fontWeight: 600, minWidth: "62px" }}>{fmtMoney(d.arr)}</span>
-                  <span style={{ color: "#e2e8f0" }}>
+                <div key={d.name + i} style={{ display: "flex", gap: "10px", fontSize: "13px", lineHeight: 1.5, alignItems: "baseline" }}>
+                  <span style={{ color: "#5eead4", fontWeight: 600, minWidth: "62px", flexShrink: 0 }}>{fmtMoney(d.arr)}</span>
+                  <span style={{ color: "#e2e8f0", flexGrow: 1 }}>
                     <strong style={{ color: "#ffffff" }}>{d.name}</strong>
-                    {d.closeDate && <span style={{ color: "#94a3b8" }}> &middot; closes {fmtDate(d.closeDate)}</span>}
-                    <span style={{ color: "#94a3b8" }}> &middot; breaks if: </span>
-                    <span style={{ color: d.topRisk ? "#fca5a5" : "#94a3b8" }}>{riskText}</span>
+                    {d.closeDate && <span style={{ color: "#94a3b8" }}> · {fmtDate(d.closeDate)}</span>}
+                    <span style={{ color: "#64748b" }}> · breaks if: </span>
+                    <span style={{ color: healthColor }}>{breakText}</span>
                   </span>
                 </div>
               );
@@ -785,62 +902,102 @@ function ReportStep({ report, onReset }) {
         )}
       </div>
 
+      {/* Hope pipeline warning — surfaces deals in commit with no urgency signal */}
+      {report.hopePipeline.length > 0 && (
+        <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderLeft: "3px solid #f59e0b", borderRadius: "0 10px 10px 0", padding: "12px 16px", marginBottom: "1.5rem" }}>
+          <p style={{ fontSize: "11px", fontWeight: 700, color: "#92400e", textTransform: "uppercase", letterSpacing: "0.05em", margin: 0, marginBottom: "4px" }}>
+            Pipeline truth check — {report.hopePipeline.length} deal{report.hopePipeline.length > 1 ? "s" : ""} flagged
+          </p>
+          <p style={{ fontSize: "13px", color: "#78350f", lineHeight: 1.6, margin: 0 }}>
+            {report.hopePipeline.map((d) => d.name).join(", ")} {report.hopePipeline.length === 1 ? "is" : "are"} in commit but without a documented urgency trigger — no confirmed budget, active procurement, or buyer-side deadline detected in the notes. {report.hopePipeline.length === 1 ? "This deal" : "These deals"} may be real, but the close thesis needs a "why now" to be defensible.
+          </p>
+        </div>
+      )}
+
+      {/* Metrics row */}
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(130px, 1fr))", gap: "10px", marginBottom: "1.75rem" }}>
         {report.quota > 0 && <MetricCard label="Quota" value={fmtMoney(report.quota)} />}
         <MetricCard label="Commit" value={fmtMoney(report.commitTotal)} sub={pctOfQuota ? `${pctOfQuota}% of quota` : null} />
-        <MetricCard label="Most likely" value={fmtMoney(report.mostLikelyTotal)} sub={`+${fmtMoney(upsideAmt)} upside`} />
+        <MetricCard label="Most likely" value={fmtMoney(report.mostLikelyTotal)} sub={upsideAmt > 0 ? `+${fmtMoney(upsideAmt)} upside` : "no incremental upside"} />
         {report.quota > 0 && <MetricCard label="Pipeline coverage" value={`${report.pipelineCoverage}x`} sub="on remaining gap" />}
         <MetricCard label="Deals in commit" value={report.commit.length} />
       </div>
 
+      {/* Deal-by-deal — commit */}
       <div style={{ marginBottom: "2rem" }}>
-        <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Deal-by-deal breakdown — commit</p>
-        {report.commit.length === 0 && <p style={{ fontSize: "13px", color: "#94a3b8" }}>No deals scored as commit. Check that your notes mention budget, champion engagement, or procurement progress.</p>}
+        <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+          Deal-by-deal breakdown — commit
+        </p>
+        {report.commit.length === 0 && (
+          <p style={{ fontSize: "13px", color: "#94a3b8", padding: "12px", background: "#f8fafc", borderRadius: "8px" }}>
+            No deals scored as commit. Ensure notes reference budget confirmation, champion engagement, or active procurement to move deals into the commit bucket.
+          </p>
+        )}
         <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
           {report.commit.map((d, i) => <DealCard key={d.name + i} deal={d} />)}
         </div>
       </div>
 
+      {/* Best case / upside */}
       {report.upside.length > 0 && (
         <div style={{ marginBottom: "2rem" }}>
-          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Upside / pipeline</p>
+          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+            Best case / upside
+          </p>
           <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
             {report.upside.map((d, i) => <DealCard key={d.name + i} deal={d} />)}
           </div>
         </div>
       )}
 
+      {/* Slipped / at risk */}
       {report.slipped.length > 0 && (
         <div style={{ marginBottom: "2rem" }}>
-          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Flagged as at risk of slipping</p>
+          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+            At risk of slipping
+          </p>
           <div style={{ display: "flex", flexDirection: "column", gap: "12px" }}>
             {report.slipped.map((d, i) => <DealCard key={d.name + i} deal={d} />)}
           </div>
         </div>
       )}
 
+      {/* Risk heatmap */}
       {report.risks.length > 0 && (
         <div style={{ marginBottom: "1rem" }}>
-          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "10px", textTransform: "uppercase", letterSpacing: "0.04em" }}>Risk register</p>
+          <p style={{ fontSize: "12px", fontWeight: 600, color: "#0d9488", margin: 0, marginBottom: "4px", textTransform: "uppercase", letterSpacing: "0.04em" }}>
+            Deal risk register
+          </p>
+          <p style={{ fontSize: "12px", color: "#94a3b8", margin: 0, marginBottom: "10px" }}>
+            Flagged by risk signal — these are the specific things that would break each deal.
+          </p>
           <div style={{ display: "flex", flexDirection: "column", gap: "8px" }}>
-            {report.risks.map((r, i) => (
-              <div key={i} style={{ border: "1px solid #e2e8f0", borderLeft: `3px solid ${r.severity === "high" ? "#ef4444" : "#f59e0b"}`, borderRadius: "0 10px 10px 0", padding: "12px 14px" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: "6px", marginBottom: "6px" }}>
-                  <p style={{ fontSize: "13px", fontWeight: 600, margin: 0 }}>{r.deal}</p>
-                  <div style={{ display: "flex", gap: "6px" }}>
-                    <Badge tone={r.severity === "high" ? "red" : "amber"}>{r.severity === "high" ? "High" : "Medium"}</Badge>
-                    <Badge tone="gray">{r.type}</Badge>
+            {report.risks
+              .sort((a, b) => (b.severity === "high" ? 1 : 0) - (a.severity === "high" ? 1 : 0))
+              .map((r, i) => {
+                const leftColor = r.health === "red" ? "#ef4444" : r.health === "green" ? "#22c55e" : "#f59e0b";
+                return (
+                  <div key={i} style={{ border: "1px solid #e2e8f0", borderLeft: `3px solid ${leftColor}`, borderRadius: "0 10px 10px 0", padding: "12px 14px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: "6px", marginBottom: "5px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                        <p style={{ fontSize: "13px", fontWeight: 600, margin: 0 }}>{r.deal}</p>
+                        {r.owner && <span style={{ fontSize: "11px", color: "#94a3b8" }}>{r.owner}</span>}
+                      </div>
+                      <div style={{ display: "flex", gap: "6px" }}>
+                        <Badge tone={r.severity === "high" ? "red" : "amber"}>{r.severity === "high" ? "High" : "Medium"}</Badge>
+                        <Badge tone="gray">{r.type}</Badge>
+                      </div>
+                    </div>
+                    <p style={{ fontSize: "13px", color: "#64748b", lineHeight: 1.6, margin: 0 }}>{r.body}</p>
                   </div>
-                </div>
-                <p style={{ fontSize: "13px", color: "#64748b", lineHeight: 1.6, margin: 0 }}>{r.body}</p>
-              </div>
-            ))}
+                );
+              })}
           </div>
         </div>
       )}
 
       <p style={{ marginTop: "2.5rem", paddingTop: "1.25rem", borderTop: "1px solid #f1f5f9", fontSize: "12px", color: "#94a3b8" }}>
-        Generated by ForecastIQ (free tier) &middot; rule-based keyword scoring, run entirely in your browser &middot; nothing was uploaded or stored
+        Generated by ForecastIQ (free tier) &middot; rule-based keyword scoring &middot; nothing uploaded or stored
       </p>
     </div>
   );
